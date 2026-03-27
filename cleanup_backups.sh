@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # cleanup_backups.sh - Retention-based backup cleanup for /home/vince/backups
 #
-# Retention policy (GFS rotation):
-#   - Last 3 days:   keep all daily backups
-#   - Last 4 weeks:  keep one backup per week (newest in each ISO week)
-#   - Beyond 4 weeks: keep one backup per month (newest in each calendar month)
+# Retention policy (GFS rotation — remote copy on /mnt/backups/lamp-22 holds full set):
+#   - Last 2 days:    keep the two most recent daily backups
+#   - Last 1 week:    keep one backup per week (newest in previous ISO week)
+#   - Beyond 1 week:  keep one backup per month (newest in each calendar month)
 #
 # Also cleans up:
 #   - Log files for deleted bundle dates (same retention as bundles)
@@ -44,22 +44,21 @@ fi
 # --- Build set of dates to keep ---
 declare -A keep_dates
 
-# Tier 1: daily — keep all backups from the last 3 days
-for d in "${!all_dates[@]}"; do
-    d_sec=$(date -d "$d" +%s)
-    age=$(( (today_sec - d_sec) / 86400 ))
-    (( age < 3 )) && keep_dates["$d"]="daily"
+# Tier 1: daily — keep the 2 most recent backups
+sorted_dates=($(printf '%s\n' "${!all_dates[@]}" | sort -r))
+for d in "${sorted_dates[@]:0:2}"; do
+    keep_dates["$d"]="daily"
 done
 
-# Tier 2: weekly — one per ISO week, for backups aged 3–27 days
+# Tier 2: weekly — newest from the previous ISO week only
+this_week=$(date +%G-W%V)
+prev_week=$(date -d "$today - 7 days" +%G-W%V)
 declare -A week_newest
 for d in "${!all_dates[@]}"; do
-    d_sec=$(date -d "$d" +%s)
-    age=$(( (today_sec - d_sec) / 86400 ))
-    if (( age >= 3 && age < 28 )); then
-        week=$(date -d "$d" +%G-W%V)
-        if [[ -z "${week_newest[$week]:-}" || "$d" > "${week_newest[$week]}" ]]; then
-            week_newest["$week"]="$d"
+    week=$(date -d "$d" +%G-W%V)
+    if [[ "$week" == "$prev_week" ]]; then
+        if [[ -z "${week_newest[$prev_week]:-}" || "$d" > "${week_newest[$prev_week]}" ]]; then
+            week_newest["$prev_week"]="$d"
         fi
     fi
 done
@@ -67,16 +66,14 @@ for d in "${week_newest[@]}"; do
     [[ -z "${keep_dates[$d]:-}" ]] && keep_dates["$d"]="weekly"
 done
 
-# Tier 3: monthly — one per calendar month, for backups aged 28+ days
+# Tier 3: monthly — one per calendar month, excluding current month
+this_month=$(date +%Y-%m)
 declare -A month_newest
 for d in "${!all_dates[@]}"; do
-    d_sec=$(date -d "$d" +%s)
-    age=$(( (today_sec - d_sec) / 86400 ))
-    if (( age >= 28 )); then
-        month="${d:0:7}"
-        if [[ -z "${month_newest[$month]:-}" || "$d" > "${month_newest[$month]}" ]]; then
-            month_newest["$month"]="$d"
-        fi
+    month="${d:0:7}"
+    [[ "$month" == "$this_month" ]] && continue
+    if [[ -z "${month_newest[$month]:-}" || "$d" > "${month_newest[$month]}" ]]; then
+        month_newest["$month"]="$d"
     fi
 done
 for d in "${month_newest[@]}"; do

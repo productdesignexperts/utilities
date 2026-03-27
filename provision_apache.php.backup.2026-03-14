@@ -1,0 +1,239 @@
+<?php
+/**
+ * provision_apache_site.php
+ *
+ * CLI PHP script to provision an Apache vhost for a given domain, set up
+ * /var/www/<domain>, enable the site, and obtain a Let's Encrypt certificate
+ * via certbot — all automatically. Logs every step and command to
+ * /var/www/<domain>/creation.log.
+ *
+ * Usage:
+ *   sudo php provision_apache_site.php <domain> [--email you@example.com] [--no-www]
+ *
+ * Notes:
+ *   - Designed for Debian/Ubuntu with Apache (apache2) and systemd.
+ *   - Requires sudo/root. Will exit if not run as root.
+ *   - If --email is omitted, certbot will register without email.
+ *   - If --no-www is passed, it will not add a www ServerAlias nor request a www cert.
+ *
+ *
+ *
+ I would like a script that takes a domain name and creates a apache website located in /var/www/domain.com configures apache and does certbot alll automatically this file should be a php script run from command line first thing it should do is check if the user is sudo it should create a log in /var/www/domainame.com/creation.log which will contain the parameters and commands used to do the creation
+sudo php provision_apache_site.php example.com --email admin@example.com
+# or, without www alias
+sudo php provision_apache_site.php example.com --email admin@example.com --no-www
+
+*
+ *
+ */
+
+if (PHP_SAPI !== 'cli') {
+    fwrite(STDERR, "This script must be run from the command line.\n");
+    exit(1);
+}
+
+function red($s){ return "\033[31m$s\033[0m"; }
+function green($s){ return "\033[32m$s\033[0m"; }
+function yellow($s){ return "\033[33m$s\033[0m"; }
+
+// ------- Parse & validate args -------
+$args = $argv;
+array_shift($args); // remove script name
+
+if (count($args) < 1) {
+    fwrite(STDERR, "Usage: sudo php provision_apache_site.php <domain> [--email you@example.com] [--no-www]\n");
+    exit(1);
+}
+
+$domain = null;
+$email = null;
+$withWWW = true;
+
+$domain = array_shift($args);
+
+while ($args) {
+    $flag = array_shift($args);
+    if ($flag === '--email') {
+        $email = $args ? array_shift($args) : null;
+    } elseif ($flag === '--no-www') {
+        $withWWW = false;
+    } else {
+        fwrite(STDERR, "Unknown option: $flag\n");
+        exit(1);
+    }
+}
+
+// Basic domain validation
+if (!preg_match('/^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z0-9-]{1,63})+$/', $domain)) {
+    fwrite(STDERR, red("Invalid domain name: $domain\n"));
+    exit(1);
+}
+
+// Root check
+if (function_exists('posix_geteuid')) {
+    if (posix_geteuid() !== 0) {
+        fwrite(STDERR, red("This script must be run as root (use sudo).\n"));
+        exit(1);
+    }
+} else {
+    // Fallback heuristic
+    $user = trim(shell_exec('id -u'));
+    if ($user !== '0') {
+        fwrite(STDERR, red("This script must be run as root (use sudo).\n"));
+        exit(1);
+    }
+}
+
+$docRoot = "/var/www/$domain";
+$publicRoot = "$docRoot/public_html";
+$logFile = "$docRoot/creation.log";
+$vhostPath = "/etc/apache2/sites-available/$domain.conf";
+$serverAlias = $withWWW ? "www.$domain" : '';
+$apacheUser = 'www-data';
+$apacheGroup = 'www-data';
+
+// ------- Logger helpers -------
+function ensureDir($path) {
+    if (!is_dir($path)) {
+        if (!mkdir($path, 0755, true)) {
+            throw new RuntimeException("Failed to create directory: $path");
+        }
+    }
+}
+
+function logLine($fh, $line) {
+    fwrite($fh, '[' . date('c') . "] $line\n");
+}
+
+function runCmd($fh, $cmd, $allowFail = false) {
+    logLine($fh, "RUN: $cmd");
+    $descriptorSpec = [
+        1 => ['pipe', 'w'], // stdout
+        2 => ['pipe', 'w'], // stderr
+    ];
+    $process = proc_open($cmd, $descriptorSpec, $pipes);
+    if (!is_resource($process)) {
+        logLine($fh, "ERROR: Failed to start process");
+        if (!$allowFail) exit(1);
+        return [1, '', ''];
+    }
+    $stdout = stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    $stderr = stream_get_contents($pipes[2]);
+    fclose($pipes[2]);
+    $exitCode = proc_close($process);
+
+    if ($stdout) logLine($fh, "STDOUT:\n$stdout");
+    if ($stderr) logLine($fh, "STDERR:\n$stderr");
+    logLine($fh, "EXIT: $exitCode");
+
+    if ($exitCode !== 0 && !$allowFail) {
+        fwrite(STDERR, red("Command failed: $cmd\nCheck log at $logFile\n"));
+        exit($exitCode);
+    }
+    return [$exitCode, $stdout, $stderr];
+}
+
+// ------- Start logging ASAP -------
+ensureDir($docRoot);
+$fh = fopen($logFile, 'a');
+if (!$fh) {
+    fwrite(STDERR, red("Cannot open log file: $logFile\n"));
+    exit(1);
+}
+
+logLine($fh, str_repeat('=', 80));
+logLine($fh, "Starting site provisioning");
+logLine($fh, "Params: domain=$domain email=" . ($email ?: '(none)') . " withWWW=" . ($withWWW ? 'yes' : 'no'));
+logLine($fh, "Run by UID=" . (function_exists('posix_geteuid') ? posix_geteuid() : trim(shell_exec('id -u'))));
+
+try {
+    // ------- Install prerequisites if missing -------
+    // Apache
+    [$codeApache] = runCmd($fh, 'apache2 -v', true);
+    if ($codeApache !== 0) {
+        runCmd($fh, 'apt-get update');
+        runCmd($fh, 'apt-get install -y apache2');
+    }
+
+    // Enable useful Apache modules
+    runCmd($fh, 'a2enmod rewrite');
+    runCmd($fh, 'a2enmod ssl');
+
+    // certbot
+    [$codeCertbot] = runCmd($fh, 'certbot --version', true);
+    if ($codeCertbot !== 0) {
+        runCmd($fh, 'apt-get install -y certbot python3-certbot-apache');
+    }
+
+    // ------- Create web root -------
+    ensureDir($publicRoot);
+    if (!file_exists("$publicRoot/index.php")) {
+        $index = <<<'PHP'
+<?php
+phpinfo();
+PHP;
+        file_put_contents("$publicRoot/index.php", $index);
+    }
+
+    // Permissions
+    runCmd($fh, sprintf('chown -R %s:%s %s', escapeshellarg($apacheUser), escapeshellarg($apacheGroup), escapeshellarg($docRoot)));
+    runCmd($fh, sprintf('find %s -type d -exec chmod 755 {} +', escapeshellarg($docRoot)));
+    runCmd($fh, sprintf('find %s -type f -exec chmod 644 {} +', escapeshellarg($docRoot)));
+
+    // ------- Create vhost -------
+    $vhost = [];
+    $vhost[] = '<VirtualHost *:80>';
+    $vhost[] = '    ServerName ' . $domain;
+    if ($withWWW) {
+        $vhost[] = '    ServerAlias ' . $serverAlias;
+    }
+    $vhost[] = '    DocumentRoot ' . $publicRoot;
+    $vhost[] = '    <Directory ' . $publicRoot . '>';
+    $vhost[] = '        Options Indexes FollowSymLinks';
+    $vhost[] = '        AllowOverride All';
+    $vhost[] = '        Require all granted';
+    $vhost[] = '    </Directory>';
+    $vhost[] = '    ErrorLog ${APACHE_LOG_DIR}/' . $domain . '_error.log';
+    $vhost[] = '    CustomLog ${APACHE_LOG_DIR}/' . $domain . '_access.log combined';
+    $vhost[] = '</VirtualHost>';
+
+    file_put_contents($vhostPath, implode("\n", $vhost) . "\n");
+    runCmd($fh, sprintf('chmod 644 %s', escapeshellarg($vhostPath)));
+
+    // Enable site
+    runCmd($fh, sprintf('a2ensite %s', escapeshellarg($domain . '.conf')));
+    runCmd($fh, 'systemctl reload apache2');
+
+    // ------- Obtain/Install TLS certs via certbot -------
+    $domains = ['-d ' . escapeshellarg($domain)];
+    if ($withWWW) {
+        $domains[] = '-d ' . escapeshellarg($serverAlias);
+    }
+    $domainArgs = implode(' ', $domains);
+
+    if ($email) {
+        $emailArg = '--email ' . escapeshellarg($email);
+    } else {
+        $emailArg = '--register-unsafely-without-email';
+    }
+
+    $certbotCmd = sprintf('certbot --non-interactive --agree-tos --redirect --apache %s %s', $emailArg, $domainArgs);
+    runCmd($fh, $certbotCmd);
+
+    // Final reload just in case
+    runCmd($fh, 'systemctl reload apache2');
+
+    logLine($fh, 'SUCCESS: Provisioning complete.');
+    fwrite(STDOUT, green("\nAll done! Site for $domain is provisioned.\n"));
+    fwrite(STDOUT, yellow("Log: $logFile\n"));
+    fwrite(STDOUT, "If DNS is set correctly, HTTPS should be active.\n");
+
+} catch (Throwable $e) {
+    logLine($fh, 'FATAL: ' . $e->getMessage());
+    fwrite(STDERR, red("Fatal error: " . $e->getMessage() . "\nSee log at $logFile\n"));
+    exit(1);
+} finally {
+    if (isset($fh) && is_resource($fh)) fclose($fh);
+}
+
